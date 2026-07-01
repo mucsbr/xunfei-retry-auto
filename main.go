@@ -155,8 +155,8 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	)
 
 	var finalResp *http.Response
-	var lastBusyBody []byte
-	busyRetries := 0
+	var lastRetryableBody []byte
+	retryableRetries := 0
 
 	for attempt := 0; attempt <= p.cfg.MaxRetries; attempt++ {
 		resp, err := p.doAttempt(r, targetURL, body, requestID, attempt)
@@ -170,11 +170,11 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		if resp.StatusCode == http.StatusServiceUnavailable {
+		if resp.StatusCode == http.StatusServiceUnavailable || resp.StatusCode == http.StatusTooManyRequests {
 			respBody, readErr := io.ReadAll(resp.Body)
 			_ = resp.Body.Close()
 			if readErr != nil {
-				p.logger.Warn("failed to read upstream 503 body",
+				p.logger.Warn("failed to read upstream retryable response candidate body",
 					"request_id", requestID,
 					"attempt", attempt+1,
 					"error", readErr,
@@ -183,16 +183,17 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 
-			if isBusy503(resp.StatusCode, respBody) {
-				lastBusyBody = respBody
+			if retryable, retryReason := retryableResponseReason(resp.StatusCode, respBody); retryable {
+				lastRetryableBody = respBody
 				if attempt < p.cfg.MaxRetries {
-					busyRetries++
-					p.logger.Warn("upstream busy, retrying",
+					retryableRetries++
+					p.logger.Warn("upstream retryable response, retrying",
 						"request_id", requestID,
 						"attempt", attempt+1,
 						"next_attempt", attempt+2,
 						"max_retries", p.cfg.MaxRetries,
 						"status", resp.StatusCode,
+						"retry_reason", retryReason,
 					)
 
 					if !sleepWithContext(r.Context(), p.cfg.RetryBackoff) {
@@ -207,7 +208,8 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					"request_id", requestID,
 					"status", resp.StatusCode,
 					"attempts", attempt+1,
-					"busy_retries", busyRetries,
+					"retryable_retries", retryableRetries,
+					"retry_reason", retryReason,
 					"duration_ms", time.Since(start).Milliseconds(),
 				)
 				return
@@ -218,8 +220,8 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				"request_id", requestID,
 				"status", resp.StatusCode,
 				"attempts", attempt+1,
-				"busy_retries", busyRetries,
-				"busy_match", false,
+				"retryable_retries", retryableRetries,
+				"retryable_match", false,
 				"duration_ms", time.Since(start).Milliseconds(),
 			)
 			return
@@ -230,12 +232,12 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if finalResp == nil {
-		p.logger.Warn("busy retry loop ended without response",
+		p.logger.Warn("retryable response loop ended without response",
 			"request_id", requestID,
-			"busy_retries", busyRetries,
+			"retryable_retries", retryableRetries,
 		)
 		w.WriteHeader(http.StatusServiceUnavailable)
-		_, _ = w.Write(lastBusyBody)
+		_, _ = w.Write(lastRetryableBody)
 		return
 	}
 	defer finalResp.Body.Close()
@@ -245,6 +247,16 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(finalResp.StatusCode)
 	bytesWritten, copyErr := copyResponseBody(w, finalResp.Body)
 	if copyErr != nil {
+		if isCanceledError(r.Context(), copyErr) {
+			p.logger.Info("client canceled response stream",
+				"request_id", requestID,
+				"status", finalResp.StatusCode,
+				"bytes_written", bytesWritten,
+				"error", copyErr,
+			)
+			return
+		}
+
 		p.logger.Warn("failed to copy upstream response body",
 			"request_id", requestID,
 			"status", finalResp.StatusCode,
@@ -257,8 +269,8 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p.logger.Info("proxy request completed",
 		"request_id", requestID,
 		"status", finalResp.StatusCode,
-		"attempts", busyRetries+1,
-		"busy_retries", busyRetries,
+		"attempts", retryableRetries+1,
+		"retryable_retries", retryableRetries,
 		"bytes_written", bytesWritten,
 		"duration_ms", time.Since(start).Milliseconds(),
 	)
@@ -337,11 +349,7 @@ func joinRawQuery(baseQuery string, requestQuery string) string {
 	}
 }
 
-func isBusy503(statusCode int, body []byte) bool {
-	if statusCode != http.StatusServiceUnavailable {
-		return false
-	}
-
+func retryableResponseReason(statusCode int, body []byte) (bool, string) {
 	var payload struct {
 		Error struct {
 			Code    int    `json:"code"`
@@ -351,21 +359,43 @@ func isBusy503(statusCode int, body []byte) bool {
 	}
 	if err := json.Unmarshal(body, &payload); err == nil {
 		message := strings.ToLower(payload.Error.Message)
-		if payload.Error.Code == 10310 {
-			return true
+		if statusCode == http.StatusServiceUnavailable && payload.Error.Code == 10310 {
+			return true, "busy_code_10310"
 		}
-		if strings.Contains(message, "busy") {
-			return true
+		if statusCode == http.StatusServiceUnavailable && strings.Contains(message, "engine timeout") {
+			return true, "engine_timeout"
 		}
-		if strings.Contains(message, "try again later") {
-			return true
+		if statusCode == http.StatusServiceUnavailable && strings.Contains(message, "busy") {
+			return true, "busy_message"
+		}
+		if statusCode == http.StatusServiceUnavailable && strings.Contains(message, "try again later") {
+			return true, "try_again_later"
+		}
+		if statusCode == http.StatusTooManyRequests && strings.Contains(message, "authorization failed") {
+			return true, "authorization_failed_429"
+		}
+		if statusCode == http.StatusServiceUnavailable && strings.Contains(message, "authorization failed") && strings.Contains(message, "429") {
+			return true, "authorization_failed_429"
 		}
 	}
 
 	text := strings.ToLower(string(body))
-	return strings.Contains(text, `"code":10310`) ||
-		strings.Contains(text, "system is busy") ||
-		(strings.Contains(text, "busy") && strings.Contains(text, "try again later"))
+	switch {
+	case statusCode == http.StatusServiceUnavailable && strings.Contains(text, `"code":10310`):
+		return true, "busy_code_10310"
+	case statusCode == http.StatusServiceUnavailable && strings.Contains(text, "engine timeout"):
+		return true, "engine_timeout"
+	case statusCode == http.StatusServiceUnavailable && strings.Contains(text, "system is busy"):
+		return true, "busy_message"
+	case statusCode == http.StatusServiceUnavailable && strings.Contains(text, "busy") && strings.Contains(text, "try again later"):
+		return true, "busy_message"
+	case statusCode == http.StatusTooManyRequests && strings.Contains(text, "authorization failed"):
+		return true, "authorization_failed_429"
+	case statusCode == http.StatusServiceUnavailable && strings.Contains(text, "authorization failed") && strings.Contains(text, "429"):
+		return true, "authorization_failed_429"
+	default:
+		return false, ""
+	}
 }
 
 func appendForwardedHeaders(req *http.Request, original *http.Request) {
@@ -432,6 +462,16 @@ func copyResponseBody(w http.ResponseWriter, body io.Reader) (int64, error) {
 		return io.Copy(flushWriter{writer: w, flusher: flusher}, body)
 	}
 	return io.Copy(w, body)
+}
+
+func isCanceledError(ctx context.Context, err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) {
+		return true
+	}
+	return ctx != nil && errors.Is(ctx.Err(), context.Canceled)
 }
 
 type flushWriter struct {

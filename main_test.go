@@ -64,6 +64,99 @@ func TestRetryOnBusy503(t *testing.T) {
 	}
 }
 
+func TestRetryOnEngineTimeout503(t *testing.T) {
+	var attempts atomic.Int32
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempt := attempts.Add(1)
+		if attempt == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`status_code=503, engine timeout`))
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer upstream.Close()
+
+	proxy := newTestProxy(t, upstream.URL+"/anthropic", 1)
+	req := httptest.NewRequest(http.MethodPost, "http://proxy/v1/messages", bytes.NewBufferString(`{"prompt":"hello"}`))
+	rec := httptest.NewRecorder()
+
+	proxy.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if got := attempts.Load(); got != 2 {
+		t.Fatalf("attempts = %d, want 2", got)
+	}
+}
+
+func TestRetryOnAuthorizationFailed429(t *testing.T) {
+	var attempts atomic.Int32
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempt := attempts.Add(1)
+		if attempt == 1 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`status_code=429, authorization failed`))
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer upstream.Close()
+
+	proxy := newTestProxy(t, upstream.URL+"/anthropic", 1)
+	req := httptest.NewRequest(http.MethodPost, "http://proxy/v1/messages", bytes.NewBufferString(`{"prompt":"hello"}`))
+	rec := httptest.NewRecorder()
+
+	proxy.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if got := attempts.Load(); got != 2 {
+		t.Fatalf("attempts = %d, want 2", got)
+	}
+}
+
+func TestRetryOnWrappedAuthorizationFailed429(t *testing.T) {
+	var attempts atomic.Int32
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempt := attempts.Add(1)
+		if attempt == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`status_code=429, authorization failed`))
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer upstream.Close()
+
+	proxy := newTestProxy(t, upstream.URL+"/anthropic", 1)
+	req := httptest.NewRequest(http.MethodPost, "http://proxy/v1/messages", bytes.NewBufferString(`{"prompt":"hello"}`))
+	rec := httptest.NewRecorder()
+
+	proxy.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if got := attempts.Load(); got != 2 {
+		t.Fatalf("attempts = %d, want 2", got)
+	}
+}
+
 func TestDoesNotRetryNonBusy503(t *testing.T) {
 	var attempts atomic.Int32
 
