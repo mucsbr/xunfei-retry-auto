@@ -170,7 +170,7 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		if resp.StatusCode == http.StatusServiceUnavailable || resp.StatusCode == http.StatusTooManyRequests {
+		if resp.StatusCode == http.StatusServiceUnavailable || resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusBadRequest {
 			respBody, readErr := io.ReadAll(resp.Body)
 			_ = resp.Body.Close()
 			if readErr != nil {
@@ -377,6 +377,12 @@ func retryableResponseReason(statusCode int, body []byte) (bool, string) {
 		if statusCode == http.StatusServiceUnavailable && strings.Contains(message, "authorization failed") && strings.Contains(message, "429") {
 			return true, "authorization_failed_429"
 		}
+		if statusCode == http.StatusBadRequest && strings.Contains(message, "invalid argument") {
+			return true, "invalid_argument_400"
+		}
+		if statusCode == http.StatusServiceUnavailable && strings.Contains(message, "invalid argument") && strings.Contains(message, "400") {
+			return true, "invalid_argument_400"
+		}
 	}
 
 	text := strings.ToLower(string(body))
@@ -393,6 +399,10 @@ func retryableResponseReason(statusCode int, body []byte) (bool, string) {
 		return true, "authorization_failed_429"
 	case statusCode == http.StatusServiceUnavailable && strings.Contains(text, "authorization failed") && strings.Contains(text, "429"):
 		return true, "authorization_failed_429"
+	case statusCode == http.StatusBadRequest && strings.Contains(text, "invalid argument"):
+		return true, "invalid_argument_400"
+	case statusCode == http.StatusServiceUnavailable && strings.Contains(text, "invalid argument") && strings.Contains(text, "400"):
+		return true, "invalid_argument_400"
 	default:
 		return false, ""
 	}

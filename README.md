@@ -1,6 +1,6 @@
 # xunfei-retry-auto
 
-一个轻量 Go 反向代理：客户端先请求本服务，本服务再转发到讯飞 MaaS Anthropic 接口；当上游响应能判断为可重试错误（例如 `503` 且 `error.code=10310`、message 包含 `busy` / `try again later`、响应体包含 `engine timeout`，或 `429` 且响应体包含 `authorization failed`）时，会按配置自动重试。
+一个轻量 Go 反向代理：客户端先请求本服务，本服务再转发到讯飞 MaaS Anthropic 接口；当上游响应能判断为可重试错误（例如 `503` 且 `error.code=10310`、message 包含 `busy` / `try again later`、响应体包含 `engine timeout`，`429` 且响应体包含 `authorization failed`，或 `400` 且响应体包含 `Invalid Argument`）时，会按配置自动重试。
 
 ## 配置
 
