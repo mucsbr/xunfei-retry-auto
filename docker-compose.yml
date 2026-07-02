@@ -9,6 +9,7 @@ services:
       LISTEN_ADDR: ":8080"
       UPSTREAM_URL: "${UPSTREAM_URL:-https://maas-coding-api.cn-huabei-1.xf-yun.com/anthropic}"
       MAX_RETRIES: "${MAX_RETRIES:-1}"
+      RETRY_GROUP_BASE: "${RETRY_GROUP_BASE:-5}"
       RETRY_BACKOFF: "${RETRY_BACKOFF:-500ms}"
       REQUEST_TIMEOUT: "${REQUEST_TIMEOUT:-0}"
     healthcheck:

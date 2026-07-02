@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -219,6 +220,175 @@ func TestRetryOnWrappedInvalidArgument400(t *testing.T) {
 	}
 }
 
+func TestRetryGroupFanoutCancelsLosersOnFirst200(t *testing.T) {
+	var retryStarted atomic.Int32
+	var canceled atomic.Int32
+	var roundTrips atomic.Int32
+	allRetryRequestsStarted := make(chan struct{})
+	var closeAllStarted sync.Once
+
+	proxy := newTestProxyWithRetryGroupBase(t, "http://upstream/anthropic", 1, 5)
+	proxy.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		roundTrip := roundTrips.Add(1)
+		if roundTrip == 1 {
+			return newTestHTTPResponse(http.StatusServiceUnavailable, `{"error":{"message":"busy"}}`), nil
+		}
+
+		started := retryStarted.Add(1)
+		if started == 5 {
+			closeAllStarted.Do(func() {
+				close(allRetryRequestsStarted)
+			})
+		}
+
+		if roundTrip == 2 {
+			select {
+			case <-allRetryRequestsStarted:
+			case <-time.After(2 * time.Second):
+				return newTestHTTPResponse(http.StatusInternalServerError, "retry fanout did not start all requests"), nil
+			}
+			return newTestHTTPResponse(http.StatusOK, `{"winner":true}`), nil
+		}
+
+		select {
+		case <-req.Context().Done():
+			canceled.Add(1)
+			return nil, req.Context().Err()
+		case <-time.After(2 * time.Second):
+			return newTestHTTPResponse(http.StatusInternalServerError, "loser request was not canceled"), nil
+		}
+	})}
+
+	req := httptest.NewRequest(http.MethodPost, "http://proxy/v1/messages", bytes.NewBufferString(`{"prompt":"hello"}`))
+	rec := httptest.NewRecorder()
+
+	proxy.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if got := roundTrips.Load(); got != 6 {
+		t.Fatalf("round trips = %d, want initial 1 + retry group 5", got)
+	}
+	if rec.Body.String() != `{"winner":true}` {
+		t.Fatalf("body = %s", rec.Body.String())
+	}
+	waitForAtomicInt32(t, &canceled, 4)
+}
+
+func TestRetryGroupReturnsTerminalError(t *testing.T) {
+	var retryStarted atomic.Int32
+	var canceled atomic.Int32
+	var roundTrips atomic.Int32
+	allRetryRequestsStarted := make(chan struct{})
+	var closeAllStarted sync.Once
+
+	proxy := newTestProxyWithRetryGroupBase(t, "http://upstream/anthropic", 1, 5)
+	proxy.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		roundTrip := roundTrips.Add(1)
+		if roundTrip == 1 {
+			return newTestHTTPResponse(http.StatusServiceUnavailable, `{"error":{"message":"busy"}}`), nil
+		}
+
+		started := retryStarted.Add(1)
+		if started == 5 {
+			closeAllStarted.Do(func() {
+				close(allRetryRequestsStarted)
+			})
+		}
+
+		if roundTrip == 2 {
+			select {
+			case <-allRetryRequestsStarted:
+			case <-time.After(2 * time.Second):
+				return newTestHTTPResponse(http.StatusInternalServerError, "retry fanout did not start all requests"), nil
+			}
+			return newTestHTTPResponse(http.StatusUnauthorized, `{"error":"bad key"}`), nil
+		}
+
+		select {
+		case <-req.Context().Done():
+			canceled.Add(1)
+			return nil, req.Context().Err()
+		case <-time.After(2 * time.Second):
+			return newTestHTTPResponse(http.StatusInternalServerError, "loser request was not canceled"), nil
+		}
+	})}
+
+	req := httptest.NewRequest(http.MethodPost, "http://proxy/v1/messages", bytes.NewBufferString(`{"prompt":"hello"}`))
+	rec := httptest.NewRecorder()
+
+	proxy.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401; body=%s", rec.Code, rec.Body.String())
+	}
+	if got := roundTrips.Load(); got != 6 {
+		t.Fatalf("round trips = %d, want initial 1 + retry group 5", got)
+	}
+	if rec.Body.String() != `{"error":"bad key"}` {
+		t.Fatalf("body = %s", rec.Body.String())
+	}
+	waitForAtomicInt32(t, &canceled, 4)
+}
+
+func TestRetryGroupsIncreaseSizeByRound(t *testing.T) {
+	var roundTrips atomic.Int32
+	var secondRoundStarted atomic.Int32
+	var canceled atomic.Int32
+	secondRoundAllStarted := make(chan struct{})
+	var closeSecondRoundStarted sync.Once
+
+	proxy := newTestProxyWithRetryGroupBase(t, "http://upstream/anthropic", 2, 2)
+	proxy.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		roundTrip := roundTrips.Add(1)
+		switch roundTrip {
+		case 1, 2, 3:
+			return newTestHTTPResponse(http.StatusServiceUnavailable, `{"error":{"message":"busy"}}`), nil
+		}
+
+		started := secondRoundStarted.Add(1)
+		if started == 3 {
+			closeSecondRoundStarted.Do(func() {
+				close(secondRoundAllStarted)
+			})
+		}
+
+		if roundTrip == 4 {
+			select {
+			case <-secondRoundAllStarted:
+			case <-time.After(2 * time.Second):
+				return newTestHTTPResponse(http.StatusInternalServerError, "second retry group did not start all requests"), nil
+			}
+			return newTestHTTPResponse(http.StatusOK, `{"round":2}`), nil
+		}
+
+		select {
+		case <-req.Context().Done():
+			canceled.Add(1)
+			return nil, req.Context().Err()
+		case <-time.After(2 * time.Second):
+			return newTestHTTPResponse(http.StatusInternalServerError, "loser request was not canceled"), nil
+		}
+	})}
+
+	req := httptest.NewRequest(http.MethodPost, "http://proxy/v1/messages", bytes.NewBufferString(`{"prompt":"hello"}`))
+	rec := httptest.NewRecorder()
+
+	proxy.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if got := roundTrips.Load(); got != 6 {
+		t.Fatalf("round trips = %d, want initial 1 + first group 2 + second group 3", got)
+	}
+	if rec.Body.String() != `{"round":2}` {
+		t.Fatalf("body = %s", rec.Body.String())
+	}
+	waitForAtomicInt32(t, &canceled, 2)
+}
+
 func TestDoesNotRetryNonBusy503(t *testing.T) {
 	var attempts atomic.Int32
 
@@ -272,6 +442,10 @@ func TestStopsAfterMaxRetries(t *testing.T) {
 }
 
 func newTestProxy(t *testing.T, upstreamRaw string, maxRetries int) *proxyServer {
+	return newTestProxyWithRetryGroupBase(t, upstreamRaw, maxRetries, 1)
+}
+
+func newTestProxyWithRetryGroupBase(t *testing.T, upstreamRaw string, maxRetries int, retryGroupBase int) *proxyServer {
 	t.Helper()
 
 	upstream, err := url.Parse(upstreamRaw)
@@ -283,7 +457,36 @@ func newTestProxy(t *testing.T, upstreamRaw string, maxRetries int) *proxyServer
 		ListenAddr:     ":0",
 		UpstreamURL:    upstream,
 		MaxRetries:     maxRetries,
+		RetryGroupBase: retryGroupBase,
 		RetryBackoff:   time.Millisecond,
 		RequestTimeout: 0,
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+}
+
+func waitForAtomicInt32(t *testing.T, value *atomic.Int32, want int32) {
+	t.Helper()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if value.Load() == want {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("value = %d, want %d", value.Load(), want)
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+func newTestHTTPResponse(statusCode int, body string) *http.Response {
+	return &http.Response{
+		StatusCode: statusCode,
+		Status:     http.StatusText(statusCode),
+		Header:     make(http.Header),
+		Body:       io.NopCloser(bytes.NewBufferString(body)),
+	}
 }

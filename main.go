@@ -14,6 +14,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -22,6 +23,7 @@ const (
 	defaultListenAddr  = ":8080"
 	defaultUpstreamURL = "https://maas-coding-api.cn-huabei-1.xf-yun.com/anthropic"
 	defaultMaxRetries  = 1
+	defaultRetryGroup  = 5
 	defaultBackoff     = 500 * time.Millisecond
 )
 
@@ -40,8 +42,36 @@ type config struct {
 	ListenAddr     string
 	UpstreamURL    *url.URL
 	MaxRetries     int
+	RetryGroupBase int
 	RetryBackoff   time.Duration
 	RequestTimeout time.Duration
+}
+
+type attemptKind int
+
+const (
+	attemptKindSuccess attemptKind = iota
+	attemptKindRetryable
+	attemptKindTerminal
+	attemptKindFailure
+)
+
+type attemptMeta struct {
+	Attempt    int
+	RetryRound int
+	GroupIndex int
+	GroupSize  int
+}
+
+type attemptResult struct {
+	kind        attemptKind
+	resp        *http.Response
+	body        []byte
+	buffered    bool
+	err         error
+	retryReason string
+	cancel      context.CancelFunc
+	meta        attemptMeta
 }
 
 type proxyServer struct {
@@ -71,6 +101,7 @@ func main() {
 		"listen_addr", cfg.ListenAddr,
 		"upstream_url", cfg.UpstreamURL.String(),
 		"max_retries", cfg.MaxRetries,
+		"retry_group_base", cfg.RetryGroupBase,
 		"retry_backoff", cfg.RetryBackoff.String(),
 		"request_timeout", durationForLog(cfg.RequestTimeout),
 	)
@@ -96,6 +127,11 @@ func loadConfig() (config, error) {
 		return config{}, err
 	}
 
+	retryGroupBase, err := parsePositiveInt("RETRY_GROUP_BASE", defaultRetryGroup)
+	if err != nil {
+		return config{}, err
+	}
+
 	backoff, err := parseDurationEnv("RETRY_BACKOFF", defaultBackoff)
 	if err != nil {
 		return config{}, err
@@ -110,12 +146,17 @@ func loadConfig() (config, error) {
 		ListenAddr:     getenv("LISTEN_ADDR", defaultListenAddr),
 		UpstreamURL:    upstream,
 		MaxRetries:     maxRetries,
+		RetryGroupBase: retryGroupBase,
 		RetryBackoff:   backoff,
 		RequestTimeout: timeout,
 	}, nil
 }
 
 func newProxyServer(cfg config, logger *slog.Logger) *proxyServer {
+	if cfg.RetryGroupBase <= 0 {
+		cfg.RetryGroupBase = defaultRetryGroup
+	}
+
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	return &proxyServer{
 		cfg: cfg,
@@ -154,130 +195,201 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		"remote_addr", clientIP(r),
 	)
 
-	var finalResp *http.Response
-	var lastRetryableBody []byte
-	retryableRetries := 0
+	upstreamRequestsIssued := 1
+	retryRoundsStarted := 0
+	result := p.executeStandaloneAttempt(r.Context(), r, targetURL, body, requestID, attemptMeta{Attempt: 1})
 
-	for attempt := 0; attempt <= p.cfg.MaxRetries; attempt++ {
-		resp, err := p.doAttempt(r, targetURL, body, requestID, attempt)
-		if err != nil {
-			p.logger.Warn("upstream request failed",
-				"request_id", requestID,
-				"attempt", attempt+1,
-				"error", err,
-			)
-			http.Error(w, "bad gateway", http.StatusBadGateway)
+	for {
+		switch result.kind {
+		case attemptKindSuccess, attemptKindTerminal:
+			p.writeAttemptResponse(w, r, result, requestID, start, upstreamRequestsIssued, retryRoundsStarted)
 			return
-		}
-
-		if resp.StatusCode == http.StatusServiceUnavailable || resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusBadRequest {
-			respBody, readErr := io.ReadAll(resp.Body)
-			_ = resp.Body.Close()
-			if readErr != nil {
-				p.logger.Warn("failed to read upstream retryable response candidate body",
-					"request_id", requestID,
-					"attempt", attempt+1,
-					"error", readErr,
-				)
-				http.Error(w, "bad gateway", http.StatusBadGateway)
+		case attemptKindFailure:
+			p.writeAttemptFailure(w, r, result, requestID, upstreamRequestsIssued, retryRoundsStarted)
+			return
+		case attemptKindRetryable:
+			if retryRoundsStarted >= p.cfg.MaxRetries {
+				p.writeAttemptResponse(w, r, result, requestID, start, upstreamRequestsIssued, retryRoundsStarted)
 				return
 			}
 
-			if retryable, retryReason := retryableResponseReason(resp.StatusCode, respBody); retryable {
-				lastRetryableBody = respBody
-				if attempt < p.cfg.MaxRetries {
-					retryableRetries++
-					p.logger.Warn("upstream retryable response, retrying",
-						"request_id", requestID,
-						"attempt", attempt+1,
-						"next_attempt", attempt+2,
-						"max_retries", p.cfg.MaxRetries,
-						"status", resp.StatusCode,
-						"retry_reason", retryReason,
-					)
-
-					if !sleepWithContext(r.Context(), p.cfg.RetryBackoff) {
-						p.logger.Warn("request canceled before retry", "request_id", requestID)
-						return
-					}
-					continue
-				}
-
-				writeBufferedResponse(w, resp, respBody)
-				p.logger.Info("proxy request completed",
-					"request_id", requestID,
-					"status", resp.StatusCode,
-					"attempts", attempt+1,
-					"retryable_retries", retryableRetries,
-					"retry_reason", retryReason,
-					"duration_ms", time.Since(start).Milliseconds(),
-				)
+			if retryRoundsStarted > 0 && !sleepWithContext(r.Context(), p.cfg.RetryBackoff) {
+				p.logger.Warn("request canceled before retry group", "request_id", requestID)
 				return
 			}
 
-			writeBufferedResponse(w, resp, respBody)
-			p.logger.Info("proxy request completed",
+			retryRoundsStarted++
+			groupSize := p.cfg.RetryGroupBase + retryRoundsStarted - 1
+			firstAttempt := upstreamRequestsIssued + 1
+			upstreamRequestsIssued += groupSize
+
+			p.logger.Warn("starting upstream retry group",
 				"request_id", requestID,
-				"status", resp.StatusCode,
-				"attempts", attempt+1,
-				"retryable_retries", retryableRetries,
-				"retryable_match", false,
-				"duration_ms", time.Since(start).Milliseconds(),
+				"retry_round", retryRoundsStarted,
+				"group_size", groupSize,
+				"max_retries", p.cfg.MaxRetries,
+				"trigger_status", result.statusCode(),
+				"trigger_retry_reason", result.retryReason,
 			)
-			return
+
+			result = p.runRetryGroup(r.Context(), r, targetURL, body, requestID, retryRoundsStarted, groupSize, firstAttempt)
 		}
-
-		finalResp = resp
-		break
 	}
-
-	if finalResp == nil {
-		p.logger.Warn("retryable response loop ended without response",
-			"request_id", requestID,
-			"retryable_retries", retryableRetries,
-		)
-		w.WriteHeader(http.StatusServiceUnavailable)
-		_, _ = w.Write(lastRetryableBody)
-		return
-	}
-	defer finalResp.Body.Close()
-
-	copyHeaders(w.Header(), finalResp.Header)
-	removeHopHeaders(w.Header())
-	w.WriteHeader(finalResp.StatusCode)
-	bytesWritten, copyErr := copyResponseBody(w, finalResp.Body)
-	if copyErr != nil {
-		if isCanceledError(r.Context(), copyErr) {
-			p.logger.Info("client canceled response stream",
-				"request_id", requestID,
-				"status", finalResp.StatusCode,
-				"bytes_written", bytesWritten,
-				"error", copyErr,
-			)
-			return
-		}
-
-		p.logger.Warn("failed to copy upstream response body",
-			"request_id", requestID,
-			"status", finalResp.StatusCode,
-			"bytes_written", bytesWritten,
-			"error", copyErr,
-		)
-		return
-	}
-
-	p.logger.Info("proxy request completed",
-		"request_id", requestID,
-		"status", finalResp.StatusCode,
-		"attempts", retryableRetries+1,
-		"retryable_retries", retryableRetries,
-		"bytes_written", bytesWritten,
-		"duration_ms", time.Since(start).Milliseconds(),
-	)
 }
 
-func (p *proxyServer) doAttempt(original *http.Request, target *url.URL, body []byte, requestID string, attempt int) (*http.Response, error) {
-	req, err := http.NewRequestWithContext(original.Context(), original.Method, target.String(), bytes.NewReader(body))
+func (p *proxyServer) executeStandaloneAttempt(parent context.Context, original *http.Request, target *url.URL, body []byte, requestID string, meta attemptMeta) attemptResult {
+	ctx, cancel := context.WithCancel(parent)
+	return p.executeAttempt(ctx, cancel, original, target, body, requestID, meta)
+}
+
+func (p *proxyServer) runRetryGroup(parent context.Context, original *http.Request, target *url.URL, body []byte, requestID string, retryRound int, groupSize int, firstAttempt int) attemptResult {
+	results := make(chan attemptResult)
+	settled := make(chan struct{})
+	var settleOnce sync.Once
+	settle := func() {
+		settleOnce.Do(func() {
+			close(settled)
+		})
+	}
+
+	cancels := make([]context.CancelFunc, groupSize)
+	for i := 0; i < groupSize; i++ {
+		ctx, cancel := context.WithCancel(parent)
+		cancels[i] = cancel
+		meta := attemptMeta{
+			Attempt:    firstAttempt + i,
+			RetryRound: retryRound,
+			GroupIndex: i + 1,
+			GroupSize:  groupSize,
+		}
+
+		go func(attemptCtx context.Context, attemptCancel context.CancelFunc, attemptMeta attemptMeta) {
+			result := p.executeAttempt(attemptCtx, attemptCancel, original, target, body, requestID, attemptMeta)
+			select {
+			case results <- result:
+			case <-settled:
+				closeAttemptResult(result)
+			}
+		}(ctx, cancel, meta)
+	}
+
+	var lastRetryable attemptResult
+	var lastFailure attemptResult
+	haveRetryable := false
+	haveFailure := false
+
+	for completed := 0; completed < groupSize; completed++ {
+		result := <-results
+
+		switch result.kind {
+		case attemptKindSuccess:
+			settle()
+			cancelAttemptContexts(cancels, result.meta.GroupIndex-1)
+			p.logger.Info("retry group won by upstream 200",
+				"request_id", requestID,
+				"retry_round", retryRound,
+				"group_size", groupSize,
+				"group_index", result.meta.GroupIndex,
+				"attempt", result.meta.Attempt,
+			)
+			return result
+		case attemptKindTerminal:
+			settle()
+			cancelAttemptContexts(cancels, result.meta.GroupIndex-1)
+			p.logger.Info("retry group stopped by terminal upstream response",
+				"request_id", requestID,
+				"retry_round", retryRound,
+				"group_size", groupSize,
+				"group_index", result.meta.GroupIndex,
+				"attempt", result.meta.Attempt,
+				"status", result.statusCode(),
+			)
+			return result
+		case attemptKindFailure:
+			if isCanceledError(parent, result.err) {
+				settle()
+				cancelAttemptContexts(cancels, -1)
+				return result
+			}
+			lastFailure = result
+			haveFailure = true
+		case attemptKindRetryable:
+			lastRetryable = result
+			haveRetryable = true
+		}
+	}
+
+	settle()
+	if haveRetryable {
+		p.logger.Warn("retry group completed with only retryable upstream responses",
+			"request_id", requestID,
+			"retry_round", retryRound,
+			"group_size", groupSize,
+			"retry_reason", lastRetryable.retryReason,
+			"status", lastRetryable.statusCode(),
+		)
+		return lastRetryable
+	}
+	if haveFailure {
+		p.logger.Warn("retry group completed with only upstream request failures",
+			"request_id", requestID,
+			"retry_round", retryRound,
+			"group_size", groupSize,
+			"error", lastFailure.err,
+		)
+		return lastFailure
+	}
+
+	return attemptResult{kind: attemptKindFailure, err: errors.New("retry group finished without results")}
+}
+
+func (p *proxyServer) executeAttempt(ctx context.Context, cancel context.CancelFunc, original *http.Request, target *url.URL, body []byte, requestID string, meta attemptMeta) attemptResult {
+	result := attemptResult{
+		kind:   attemptKindFailure,
+		cancel: cancel,
+		meta:   meta,
+	}
+
+	resp, err := p.doAttempt(ctx, original, target, body, requestID, meta)
+	if err != nil {
+		cancel()
+		result.err = err
+		return result
+	}
+	result.resp = resp
+
+	if resp.StatusCode == http.StatusOK {
+		result.kind = attemptKindSuccess
+		return result
+	}
+
+	if shouldInspectResponse(resp.StatusCode) {
+		respBody, readErr := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		cancel()
+		result.body = respBody
+		result.buffered = true
+		if readErr != nil {
+			result.err = readErr
+			return result
+		}
+
+		if retryable, retryReason := retryableResponseReason(resp.StatusCode, respBody); retryable {
+			result.kind = attemptKindRetryable
+			result.retryReason = retryReason
+			return result
+		}
+
+		result.kind = attemptKindTerminal
+		return result
+	}
+
+	result.kind = attemptKindTerminal
+	return result
+}
+
+func (p *proxyServer) doAttempt(ctx context.Context, original *http.Request, target *url.URL, body []byte, requestID string, meta attemptMeta) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, original.Method, target.String(), bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
@@ -288,14 +400,136 @@ func (p *proxyServer) doAttempt(original *http.Request, target *url.URL, body []
 	req.Host = target.Host
 	req.ContentLength = int64(len(body))
 
-	p.logger.Info("upstream attempt",
+	logAttrs := []any{
 		"request_id", requestID,
-		"attempt", attempt+1,
+		"attempt", meta.Attempt,
 		"method", req.Method,
 		"target", target.Redacted(),
-	)
+	}
+	if meta.RetryRound > 0 {
+		logAttrs = append(logAttrs,
+			"retry_round", meta.RetryRound,
+			"group_index", meta.GroupIndex,
+			"group_size", meta.GroupSize,
+		)
+	}
+	p.logger.Info("upstream attempt", logAttrs...)
 
 	return p.client.Do(req)
+}
+
+func (p *proxyServer) writeAttemptResponse(w http.ResponseWriter, r *http.Request, result attemptResult, requestID string, start time.Time, upstreamRequestsIssued int, retryRoundsStarted int) {
+	defer closeAttemptResult(result)
+
+	status := result.statusCode()
+	if result.buffered {
+		writeBufferedResponse(w, result.resp, result.body)
+		p.logRequestCompleted(requestID, status, upstreamRequestsIssued, retryRoundsStarted, result, int64(len(result.body)), time.Since(start))
+		return
+	}
+
+	copyHeaders(w.Header(), result.resp.Header)
+	removeHopHeaders(w.Header())
+	w.WriteHeader(status)
+	bytesWritten, copyErr := copyResponseBody(w, result.resp.Body)
+	if copyErr != nil {
+		if isCanceledError(r.Context(), copyErr) {
+			p.logger.Info("client canceled response stream",
+				"request_id", requestID,
+				"status", status,
+				"bytes_written", bytesWritten,
+				"error", copyErr,
+			)
+			return
+		}
+
+		p.logger.Warn("failed to copy upstream response body",
+			"request_id", requestID,
+			"status", status,
+			"bytes_written", bytesWritten,
+			"error", copyErr,
+		)
+		return
+	}
+
+	p.logRequestCompleted(requestID, status, upstreamRequestsIssued, retryRoundsStarted, result, bytesWritten, time.Since(start))
+}
+
+func (p *proxyServer) writeAttemptFailure(w http.ResponseWriter, r *http.Request, result attemptResult, requestID string, upstreamRequestsIssued int, retryRoundsStarted int) {
+	defer closeAttemptResult(result)
+
+	if isCanceledError(r.Context(), result.err) {
+		p.logger.Info("request canceled during upstream request",
+			"request_id", requestID,
+			"upstream_requests_issued", upstreamRequestsIssued,
+			"retry_rounds_started", retryRoundsStarted,
+			"error", result.err,
+		)
+		return
+	}
+
+	p.logger.Warn("upstream request failed",
+		"request_id", requestID,
+		"attempt", result.meta.Attempt,
+		"retry_round", result.meta.RetryRound,
+		"upstream_requests_issued", upstreamRequestsIssued,
+		"retry_rounds_started", retryRoundsStarted,
+		"error", result.err,
+	)
+	http.Error(w, "bad gateway", http.StatusBadGateway)
+}
+
+func (p *proxyServer) logRequestCompleted(requestID string, status int, upstreamRequestsIssued int, retryRoundsStarted int, result attemptResult, bytesWritten int64, duration time.Duration) {
+	attrs := []any{
+		"request_id", requestID,
+		"status", status,
+		"upstream_requests_issued", upstreamRequestsIssued,
+		"retry_rounds_started", retryRoundsStarted,
+		"bytes_written", bytesWritten,
+		"duration_ms", duration.Milliseconds(),
+	}
+	if result.retryReason != "" {
+		attrs = append(attrs, "retry_reason", result.retryReason)
+	}
+	if result.meta.RetryRound > 0 {
+		attrs = append(attrs,
+			"winning_retry_round", result.meta.RetryRound,
+			"winning_group_index", result.meta.GroupIndex,
+			"winning_group_size", result.meta.GroupSize,
+		)
+	}
+	p.logger.Info("proxy request completed", attrs...)
+}
+
+func (r attemptResult) statusCode() int {
+	if r.resp == nil {
+		return 0
+	}
+	return r.resp.StatusCode
+}
+
+func shouldInspectResponse(statusCode int) bool {
+	return statusCode == http.StatusServiceUnavailable ||
+		statusCode == http.StatusTooManyRequests ||
+		statusCode == http.StatusBadRequest
+}
+
+func cancelAttemptContexts(cancels []context.CancelFunc, keep int) {
+	for i, cancel := range cancels {
+		if cancel == nil || i == keep {
+			continue
+		}
+		cancel()
+	}
+}
+
+func closeAttemptResult(result attemptResult) {
+	if result.resp != nil && result.resp.Body != nil {
+		_ = result.resp.Body.Close()
+	}
+	if result.cancel != nil {
+		result.cancel()
+	}
 }
 
 func (p *proxyServer) requestID(r *http.Request) string {
@@ -531,6 +765,22 @@ func parseNonNegativeInt(key string, fallback int) (int, error) {
 	}
 	if value < 0 {
 		return 0, fmt.Errorf("%s must be >= 0", key)
+	}
+	return value, nil
+}
+
+func parsePositiveInt(key string, fallback int) (int, error) {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback, nil
+	}
+
+	value, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, fmt.Errorf("%s must be an integer: %w", key, err)
+	}
+	if value <= 0 {
+		return 0, fmt.Errorf("%s must be > 0", key)
 	}
 	return value, nil
 }
