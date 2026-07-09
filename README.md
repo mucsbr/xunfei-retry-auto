@@ -45,6 +45,24 @@ docker compose up -d --build
 MAX_RETRIES=3 RETRY_GROUP_BASE=5 RETRY_BACKOFF=1s docker compose up -d --build
 ```
 
+## 管理页面
+
+访问：
+
+```text
+http://127.0.0.1:8080/admin
+```
+
+页面提供：
+
+- 成功率：按 client 请求计算，最终返回 `200` 就算成功；中间重试多少次不影响本次成功判定
+- 重试率：触发过至少一轮重试组的 client 请求占比
+- 平均首字时间：代理向 client 写出首个响应 body 字节的平均时间
+- 重试成功率：只统计重试组里实际完成的上游请求；被同组 `200` 胜出后取消的请求不计入分母
+- 5h / 周 / 月请求数：只统计最终成功的 client 请求；5h 按 1 小时桶展示，周按 1 天桶展示，月为本月自然月
+- 请求表格：请求时间、首字时间、返回状态码、重试轮数、上游请求数、请求 ID
+- 非 `200` 请求支持查看最终返回给 client 的原始错误响应 headers + body
+
 ## 日志
 
 服务使用 JSON 日志输出到 stdout，会记录：

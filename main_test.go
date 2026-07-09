@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
@@ -441,6 +442,87 @@ func TestStopsAfterMaxRetries(t *testing.T) {
 	}
 }
 
+func TestAdminMetricsRecordsSuccessfulRetry(t *testing.T) {
+	var attempts atomic.Int32
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempt := attempts.Add(1)
+		if attempt == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`{"error":{"message":"busy"}}`))
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer upstream.Close()
+
+	proxy := newTestProxy(t, upstream.URL+"/anthropic", 1)
+	req := httptest.NewRequest(http.MethodPost, "http://proxy/v1/messages", bytes.NewBufferString(`{}`))
+	rec := httptest.NewRecorder()
+	proxy.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+
+	snapshot := getAdminSnapshot(t, proxy)
+	if snapshot.Summary.TotalRequests != 1 {
+		t.Fatalf("total requests = %d, want 1", snapshot.Summary.TotalRequests)
+	}
+	if snapshot.Summary.SuccessRequests != 1 {
+		t.Fatalf("success requests = %d, want 1", snapshot.Summary.SuccessRequests)
+	}
+	if snapshot.Summary.RetriedRequests != 1 {
+		t.Fatalf("retried requests = %d, want 1", snapshot.Summary.RetriedRequests)
+	}
+	if snapshot.Summary.RetryAttemptsCompleted != 1 || snapshot.Summary.RetryAttemptsSucceeded != 1 {
+		t.Fatalf("retry attempts = %d/%d, want 1/1", snapshot.Summary.RetryAttemptsSucceeded, snapshot.Summary.RetryAttemptsCompleted)
+	}
+	if len(snapshot.Records) != 1 || snapshot.Records[0].StatusCode != http.StatusOK {
+		t.Fatalf("records = %#v, want one 200 record", snapshot.Records)
+	}
+}
+
+func TestAdminMetricsStoresRawErrorDetail(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Upstream-Error", "raw")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":"bad key"}`))
+	}))
+	defer upstream.Close()
+
+	proxy := newTestProxy(t, upstream.URL+"/anthropic", 1)
+	req := httptest.NewRequest(http.MethodPost, "http://proxy/v1/messages", bytes.NewBufferString(`{}`))
+	rec := httptest.NewRecorder()
+	proxy.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401; body=%s", rec.Code, rec.Body.String())
+	}
+
+	snapshot := getAdminSnapshot(t, proxy)
+	if len(snapshot.Records) != 1 {
+		t.Fatalf("records len = %d, want 1", len(snapshot.Records))
+	}
+	errorID := snapshot.Records[0].ErrorID
+	if errorID == "" {
+		t.Fatalf("missing error id in record: %#v", snapshot.Records[0])
+	}
+
+	detail := getAdminErrorDetail(t, proxy, errorID)
+	if detail.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("error detail status = %d, want 401", detail.StatusCode)
+	}
+	if got := detail.Headers["X-Upstream-Error"]; len(got) != 1 || got[0] != "raw" {
+		t.Fatalf("error detail header = %#v, want raw header", got)
+	}
+	if detail.Body != `{"error":"bad key"}` {
+		t.Fatalf("error detail body = %q", detail.Body)
+	}
+}
+
 func newTestProxy(t *testing.T, upstreamRaw string, maxRetries int) *proxyServer {
 	return newTestProxyWithRetryGroupBase(t, upstreamRaw, maxRetries, 1)
 }
@@ -489,4 +571,38 @@ func newTestHTTPResponse(statusCode int, body string) *http.Response {
 		Header:     make(http.Header),
 		Body:       io.NopCloser(bytes.NewBufferString(body)),
 	}
+}
+
+func getAdminSnapshot(t *testing.T, proxy *proxyServer) adminSnapshot {
+	t.Helper()
+
+	req := httptest.NewRequest(http.MethodGet, "http://proxy/admin/api/metrics", nil)
+	rec := httptest.NewRecorder()
+	proxy.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("admin metrics status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+
+	var snapshot adminSnapshot
+	if err := json.NewDecoder(rec.Body).Decode(&snapshot); err != nil {
+		t.Fatalf("decode admin metrics: %v", err)
+	}
+	return snapshot
+}
+
+func getAdminErrorDetail(t *testing.T, proxy *proxyServer, errorID string) errorDetail {
+	t.Helper()
+
+	req := httptest.NewRequest(http.MethodGet, "http://proxy/admin/api/errors/"+errorID, nil)
+	rec := httptest.NewRecorder()
+	proxy.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("admin error status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+
+	var detail errorDetail
+	if err := json.NewDecoder(rec.Body).Decode(&detail); err != nil {
+		t.Fatalf("decode admin error: %v", err)
+	}
+	return detail
 }
