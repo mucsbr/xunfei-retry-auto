@@ -26,7 +26,7 @@ func TestRetryOnBusy503(t *testing.T) {
 		}
 		seenBodies = append(seenBodies, string(body))
 
-		if r.URL.Path != "/anthropic/v1/messages" {
+		if r.URL.Path != "/anthropic/v1/chat/completions" {
 			t.Fatalf("unexpected upstream path: %s", r.URL.Path)
 		}
 		if r.URL.RawQuery != "model=test" {
@@ -47,7 +47,7 @@ func TestRetryOnBusy503(t *testing.T) {
 	defer upstream.Close()
 
 	proxy := newTestProxy(t, upstream.URL+"/anthropic", 1)
-	req := httptest.NewRequest(http.MethodPost, "http://proxy/v1/messages?model=test", bytes.NewBufferString(`{"prompt":"hello"}`))
+	req := httptest.NewRequest(http.MethodPost, "http://proxy/v1/chat/completions?model=test", bytes.NewBufferString(`{"prompt":"hello"}`))
 	rec := httptest.NewRecorder()
 
 	proxy.ServeHTTP(rec, req)
@@ -84,7 +84,7 @@ func TestRetryOnEngineTimeout503(t *testing.T) {
 	defer upstream.Close()
 
 	proxy := newTestProxy(t, upstream.URL+"/anthropic", 1)
-	req := httptest.NewRequest(http.MethodPost, "http://proxy/v1/messages", bytes.NewBufferString(`{"prompt":"hello"}`))
+	req := httptest.NewRequest(http.MethodPost, "http://proxy/v1/chat/completions", bytes.NewBufferString(`{"prompt":"hello"}`))
 	rec := httptest.NewRecorder()
 
 	proxy.ServeHTTP(rec, req)
@@ -115,7 +115,7 @@ func TestRetryOnAuthorizationFailed429(t *testing.T) {
 	defer upstream.Close()
 
 	proxy := newTestProxy(t, upstream.URL+"/anthropic", 1)
-	req := httptest.NewRequest(http.MethodPost, "http://proxy/v1/messages", bytes.NewBufferString(`{"prompt":"hello"}`))
+	req := httptest.NewRequest(http.MethodPost, "http://proxy/v1/chat/completions", bytes.NewBufferString(`{"prompt":"hello"}`))
 	rec := httptest.NewRecorder()
 
 	proxy.ServeHTTP(rec, req)
@@ -146,7 +146,7 @@ func TestRetryOnWrappedAuthorizationFailed429(t *testing.T) {
 	defer upstream.Close()
 
 	proxy := newTestProxy(t, upstream.URL+"/anthropic", 1)
-	req := httptest.NewRequest(http.MethodPost, "http://proxy/v1/messages", bytes.NewBufferString(`{"prompt":"hello"}`))
+	req := httptest.NewRequest(http.MethodPost, "http://proxy/v1/chat/completions", bytes.NewBufferString(`{"prompt":"hello"}`))
 	rec := httptest.NewRecorder()
 
 	proxy.ServeHTTP(rec, req)
@@ -177,7 +177,7 @@ func TestRetryOnInvalidArgument400(t *testing.T) {
 	defer upstream.Close()
 
 	proxy := newTestProxy(t, upstream.URL+"/anthropic", 1)
-	req := httptest.NewRequest(http.MethodPost, "http://proxy/v1/messages", bytes.NewBufferString(`{"prompt":"hello"}`))
+	req := httptest.NewRequest(http.MethodPost, "http://proxy/v1/chat/completions", bytes.NewBufferString(`{"prompt":"hello"}`))
 	rec := httptest.NewRecorder()
 
 	proxy.ServeHTTP(rec, req)
@@ -208,7 +208,7 @@ func TestRetryOnWrappedInvalidArgument400(t *testing.T) {
 	defer upstream.Close()
 
 	proxy := newTestProxy(t, upstream.URL+"/anthropic", 1)
-	req := httptest.NewRequest(http.MethodPost, "http://proxy/v1/messages", bytes.NewBufferString(`{"prompt":"hello"}`))
+	req := httptest.NewRequest(http.MethodPost, "http://proxy/v1/chat/completions", bytes.NewBufferString(`{"prompt":"hello"}`))
 	rec := httptest.NewRecorder()
 
 	proxy.ServeHTTP(rec, req)
@@ -260,7 +260,7 @@ func TestRetryGroupFanoutCancelsLosersOnFirst200(t *testing.T) {
 		}
 	})}
 
-	req := httptest.NewRequest(http.MethodPost, "http://proxy/v1/messages", bytes.NewBufferString(`{"prompt":"hello"}`))
+	req := httptest.NewRequest(http.MethodPost, "http://proxy/v1/chat/completions", bytes.NewBufferString(`{"prompt":"hello"}`))
 	rec := httptest.NewRecorder()
 
 	proxy.ServeHTTP(rec, req)
@@ -316,7 +316,7 @@ func TestRetryGroupReturnsTerminalError(t *testing.T) {
 		}
 	})}
 
-	req := httptest.NewRequest(http.MethodPost, "http://proxy/v1/messages", bytes.NewBufferString(`{"prompt":"hello"}`))
+	req := httptest.NewRequest(http.MethodPost, "http://proxy/v1/chat/completions", bytes.NewBufferString(`{"prompt":"hello"}`))
 	rec := httptest.NewRecorder()
 
 	proxy.ServeHTTP(rec, req)
@@ -373,7 +373,7 @@ func TestRetryGroupsIncreaseSizeByRound(t *testing.T) {
 		}
 	})}
 
-	req := httptest.NewRequest(http.MethodPost, "http://proxy/v1/messages", bytes.NewBufferString(`{"prompt":"hello"}`))
+	req := httptest.NewRequest(http.MethodPost, "http://proxy/v1/chat/completions", bytes.NewBufferString(`{"prompt":"hello"}`))
 	rec := httptest.NewRecorder()
 
 	proxy.ServeHTTP(rec, req)
@@ -401,7 +401,7 @@ func TestDoesNotRetryNonBusy503(t *testing.T) {
 	defer upstream.Close()
 
 	proxy := newTestProxy(t, upstream.URL+"/anthropic", 3)
-	req := httptest.NewRequest(http.MethodPost, "http://proxy/anthropic", bytes.NewBufferString(`{}`))
+	req := httptest.NewRequest(http.MethodPost, "http://proxy/v1/chat/completions", bytes.NewBufferString(`{}`))
 	rec := httptest.NewRecorder()
 
 	proxy.ServeHTTP(rec, req)
@@ -426,7 +426,7 @@ func TestStopsAfterMaxRetries(t *testing.T) {
 	defer upstream.Close()
 
 	proxy := newTestProxy(t, upstream.URL+"/anthropic", 1)
-	req := httptest.NewRequest(http.MethodPost, "http://proxy/", bytes.NewBufferString(`{}`))
+	req := httptest.NewRequest(http.MethodPost, "http://proxy/v1/chat/completions", bytes.NewBufferString(`{}`))
 	rec := httptest.NewRecorder()
 
 	proxy.ServeHTTP(rec, req)
@@ -459,7 +459,7 @@ func TestAdminMetricsRecordsSuccessfulRetry(t *testing.T) {
 	defer upstream.Close()
 
 	proxy := newTestProxy(t, upstream.URL+"/anthropic", 1)
-	req := httptest.NewRequest(http.MethodPost, "http://proxy/v1/messages", bytes.NewBufferString(`{}`))
+	req := httptest.NewRequest(http.MethodPost, "http://proxy/v1/chat/completions", bytes.NewBufferString(`{}`))
 	rec := httptest.NewRecorder()
 	proxy.ServeHTTP(rec, req)
 
@@ -494,7 +494,7 @@ func TestAdminMetricsStoresRawErrorDetail(t *testing.T) {
 	defer upstream.Close()
 
 	proxy := newTestProxy(t, upstream.URL+"/anthropic", 1)
-	req := httptest.NewRequest(http.MethodPost, "http://proxy/v1/messages", bytes.NewBufferString(`{}`))
+	req := httptest.NewRequest(http.MethodPost, "http://proxy/v1/chat/completions", bytes.NewBufferString(`{}`))
 	rec := httptest.NewRecorder()
 	proxy.ServeHTTP(rec, req)
 
@@ -552,6 +552,36 @@ func TestAdminRoutesNeverProxyToUpstream(t *testing.T) {
 
 	if got := roundTrips.Load(); got != 0 {
 		t.Fatalf("admin routes proxied upstream %d times, want 0", got)
+	}
+}
+
+func TestOnlyChatCompletionsPathsProxyToUpstream(t *testing.T) {
+	var roundTrips atomic.Int32
+
+	proxy := newTestProxyWithRetryGroupBase(t, "http://upstream/anthropic", 1, 5)
+	proxy.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		roundTrips.Add(1)
+		return newTestHTTPResponse(http.StatusOK, `{"ok":true}`), nil
+	})}
+
+	blockedPaths := []string{"/favicon.ico", "/v1/messages", "/"}
+	for _, path := range blockedPaths {
+		req := httptest.NewRequest(http.MethodPost, "http://proxy"+path, bytes.NewBufferString(`{}`))
+		rec := httptest.NewRecorder()
+		proxy.ServeHTTP(rec, req)
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("%s status = %d, want 404", path, rec.Code)
+		}
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "http://proxy/v1/chat/completions", bytes.NewBufferString(`{}`))
+	rec := httptest.NewRecorder()
+	proxy.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("allowed path status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if got := roundTrips.Load(); got != 1 {
+		t.Fatalf("round trips = %d, want only allowed path to proxy once", got)
 	}
 }
 

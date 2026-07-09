@@ -183,6 +183,11 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if !isAllowedProxyPath(r.URL.Path) {
+		http.NotFound(w, r)
+		return
+	}
+
 	start := time.Now()
 	requestID := p.requestID(r)
 	targetURL := buildTargetURL(p.cfg.UpstreamURL, r)
@@ -651,6 +656,10 @@ func joinRawQuery(baseQuery string, requestQuery string) string {
 	default:
 		return baseQuery + "&" + requestQuery
 	}
+}
+
+func isAllowedProxyPath(path string) bool {
+	return strings.Contains(path, "/chat/completions")
 }
 
 func retryableResponseReason(statusCode int, body []byte) (bool, string) {

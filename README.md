@@ -25,13 +25,13 @@ go run .
 请求示例：
 
 ```bash
-curl -N http://127.0.0.1:8080/anthropic \
+curl -N http://127.0.0.1:8080/v1/chat/completions \
   -H 'Authorization: Bearer <token>' \
   -H 'Content-Type: application/json' \
   -d '{...}'
 ```
 
-也可以请求根路径 `/`，默认会转发到 `UPSTREAM_URL`；请求 `/v1/messages` 会转发到 `UPSTREAM_URL` 下的 `/v1/messages`。如果请求路径已经以 `/anthropic` 开头，不会重复拼接。
+代理只转发 path 里包含 `/chat/completions` 的请求；其他路径（例如 `/favicon.ico`、`/v1/messages`、`/`）会直接返回 `404`，不会访问上游。请求 `/v1/chat/completions` 会转发到 `UPSTREAM_URL` 下的 `/v1/chat/completions`。
 
 ## Docker Compose 部署
 
