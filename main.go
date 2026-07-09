@@ -490,8 +490,11 @@ func (p *proxyServer) writeAttemptResponse(w http.ResponseWriter, r *http.Reques
 	}
 	if copyErr != nil {
 		if isCanceledError(r.Context(), copyErr) {
-			errorID := p.metrics.storeError(requestID, start, 499, http.Header{}, []byte("client canceled response stream: "+copyErr.Error()))
-			p.recordRequestMetrics(requestID, start, firstByteMS, 499, upstreamRequestsIssued, retryRoundsStarted, retryAttemptsCompleted, retryAttemptsSucceeded, errorID)
+			errorID := ""
+			if status != http.StatusOK {
+				errorID = p.metrics.storeError(requestID, start, status, result.resp.Header, []byte("client canceled response stream: "+copyErr.Error()))
+			}
+			p.recordRequestMetrics(requestID, start, firstByteMS, status, upstreamRequestsIssued, retryRoundsStarted, retryAttemptsCompleted, retryAttemptsSucceeded, errorID)
 			p.logger.Info("client canceled response stream",
 				"request_id", requestID,
 				"status", status,

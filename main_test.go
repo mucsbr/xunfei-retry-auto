@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -523,6 +524,44 @@ func TestAdminMetricsStoresRawErrorDetail(t *testing.T) {
 	}
 }
 
+func TestAdminMetricsKeeps200WhenClientCancelHappensAfterBodyBytes(t *testing.T) {
+	proxy := newTestProxyWithRetryGroupBase(t, "http://upstream/anthropic", 1, 5)
+	proxy.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Status:     http.StatusText(http.StatusOK),
+			Header:     make(http.Header),
+			Body:       &cancelAfterDataBody{data: []byte(`{"ok":true}`)},
+		}, nil
+	})}
+
+	req := httptest.NewRequest(http.MethodPost, "http://proxy/v1/chat/completions", bytes.NewBufferString(`{}`))
+	rec := httptest.NewRecorder()
+	proxy.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if rec.Body.String() != `{"ok":true}` {
+		t.Fatalf("body = %q, want successful payload", rec.Body.String())
+	}
+
+	snapshot := getAdminSnapshot(t, proxy)
+	if snapshot.Summary.SuccessRequests != 1 {
+		t.Fatalf("success requests = %d, want 1", snapshot.Summary.SuccessRequests)
+	}
+	if len(snapshot.Records) != 1 {
+		t.Fatalf("records len = %d, want 1", len(snapshot.Records))
+	}
+	record := snapshot.Records[0]
+	if record.StatusCode != http.StatusOK {
+		t.Fatalf("record status = %d, want 200", record.StatusCode)
+	}
+	if record.ErrorID != "" {
+		t.Fatalf("record error id = %q, want empty", record.ErrorID)
+	}
+}
+
 func TestAdminRoutesNeverProxyToUpstream(t *testing.T) {
 	var roundTrips atomic.Int32
 
@@ -633,6 +672,23 @@ func newTestHTTPResponse(statusCode int, body string) *http.Response {
 		Header:     make(http.Header),
 		Body:       io.NopCloser(bytes.NewBufferString(body)),
 	}
+}
+
+type cancelAfterDataBody struct {
+	data []byte
+	read bool
+}
+
+func (b *cancelAfterDataBody) Read(p []byte) (int, error) {
+	if !b.read {
+		b.read = true
+		return copy(p, b.data), nil
+	}
+	return 0, context.Canceled
+}
+
+func (b *cancelAfterDataBody) Close() error {
+	return nil
 }
 
 func getAdminSnapshot(t *testing.T, proxy *proxyServer) adminSnapshot {
