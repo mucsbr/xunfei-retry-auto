@@ -14,6 +14,7 @@
 | `RETRY_GROUP_BASE` | `5` | 第 1 轮重试组的并发请求数；后续每轮加 1 |
 | `RETRY_BACKOFF` | `500ms` | 第 2 轮及之后的重试组启动前等待时间，支持 Go duration，例如 `200ms`、`1s`；第 1 轮重试组会立即发起 |
 | `REQUEST_TIMEOUT` | `0` | 单次请求超时；`0` 表示不设置总超时，适合流式响应 |
+| `METRICS_DB_PATH` | `data/xunfei-retry-proxy.db` | 管理页指标 SQLite 数据库路径；Docker Compose 默认使用 `/data/xunfei-retry-proxy.db` |
 | `PROXY_PORT` | `8080` | docker compose 暴露到宿主机的端口 |
 
 ## 本地运行
@@ -62,6 +63,8 @@ http://127.0.0.1:8080/admin
 - 5h / 周 / 月请求数：只统计最终成功的 client 请求；5h 按 1 小时桶展示，周按 1 天桶展示，月为本月自然月
 - 请求表格：请求时间、首字时间、返回状态码、重试轮数、上游请求数、请求 ID
 - 非 `200` 请求支持查看最终返回给 client 的原始错误响应 headers + body
+
+管理页数据会写入 SQLite。Docker Compose 默认挂载 named volume `xunfei-retry-data` 到 `/data`，所以容器重启后指标和错误详情不会丢。本地 `go run .` 默认写到项目下的 `data/xunfei-retry-proxy.db`。
 
 ## 日志
 

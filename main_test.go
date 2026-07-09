@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -562,6 +563,57 @@ func TestAdminMetricsKeeps200WhenClientCancelHappensAfterBodyBytes(t *testing.T)
 	}
 }
 
+func TestMetricsStorePersistsAcrossReopen(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "metrics.db")
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	store, err := newMetricsStore(dbPath, defaultMaxErrorBody, logger)
+	if err != nil {
+		t.Fatalf("new metrics store: %v", err)
+	}
+
+	startedAt := time.Now().Add(-time.Minute)
+	errorID := store.storeError("req-1", startedAt, http.StatusUnauthorized, http.Header{"X-Test": []string{"raw"}}, []byte(`{"error":"bad key"}`))
+	if errorID == "" {
+		t.Fatal("expected error id")
+	}
+	store.record(requestRecord{
+		RequestID:              "req-1",
+		StartedAt:              startedAt,
+		FirstByteMS:            123,
+		StatusCode:             http.StatusUnauthorized,
+		Success:                false,
+		Retried:                true,
+		RetryRounds:            1,
+		UpstreamRequestsIssued: 6,
+		ErrorID:                errorID,
+	})
+	if err := store.db.Close(); err != nil {
+		t.Fatalf("close metrics db: %v", err)
+	}
+
+	reopened, err := newMetricsStore(dbPath, defaultMaxErrorBody, logger)
+	if err != nil {
+		t.Fatalf("reopen metrics store: %v", err)
+	}
+	defer reopened.db.Close()
+
+	snapshot := reopened.snapshot(time.Now())
+	if snapshot.Summary.TotalRequests != 1 {
+		t.Fatalf("total requests = %d, want 1", snapshot.Summary.TotalRequests)
+	}
+	if len(snapshot.Records) != 1 || snapshot.Records[0].ErrorID != errorID {
+		t.Fatalf("records = %#v, want persisted error id %q", snapshot.Records, errorID)
+	}
+	detail, ok := reopened.getError(errorID)
+	if !ok {
+		t.Fatalf("missing persisted error detail %q", errorID)
+	}
+	if detail.Body != `{"error":"bad key"}` {
+		t.Fatalf("body = %q, want persisted raw body", detail.Body)
+	}
+}
+
 func TestAdminRoutesNeverProxyToUpstream(t *testing.T) {
 	var roundTrips atomic.Int32
 
@@ -636,14 +688,19 @@ func newTestProxyWithRetryGroupBase(t *testing.T, upstreamRaw string, maxRetries
 		t.Fatalf("parse upstream url: %v", err)
 	}
 
-	return newProxyServer(config{
+	proxy, err := newProxyServer(config{
 		ListenAddr:     ":0",
 		UpstreamURL:    upstream,
 		MaxRetries:     maxRetries,
 		RetryGroupBase: retryGroupBase,
 		RetryBackoff:   time.Millisecond,
 		RequestTimeout: 0,
+		MetricsDBPath:  ":memory:",
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatalf("new proxy server: %v", err)
+	}
+	return proxy
 }
 
 func waitForAtomicInt32(t *testing.T, value *atomic.Int32, want int32) {

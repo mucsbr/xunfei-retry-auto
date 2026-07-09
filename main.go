@@ -45,6 +45,7 @@ type config struct {
 	RetryGroupBase int
 	RetryBackoff   time.Duration
 	RequestTimeout time.Duration
+	MetricsDBPath  string
 }
 
 type attemptKind int
@@ -93,7 +94,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	proxy := newProxyServer(cfg, logger)
+	proxy, err := newProxyServer(cfg, logger)
+	if err != nil {
+		logger.Error("failed to initialize proxy", "error", err)
+		os.Exit(1)
+	}
 	server := &http.Server{
 		Addr:              cfg.ListenAddr,
 		Handler:           proxy,
@@ -107,6 +112,7 @@ func main() {
 		"retry_group_base", cfg.RetryGroupBase,
 		"retry_backoff", cfg.RetryBackoff.String(),
 		"request_timeout", durationForLog(cfg.RequestTimeout),
+		"metrics_db_path", cfg.MetricsDBPath,
 	)
 
 	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -152,12 +158,18 @@ func loadConfig() (config, error) {
 		RetryGroupBase: retryGroupBase,
 		RetryBackoff:   backoff,
 		RequestTimeout: timeout,
+		MetricsDBPath:  getenv("METRICS_DB_PATH", defaultMetricsDBPath),
 	}, nil
 }
 
-func newProxyServer(cfg config, logger *slog.Logger) *proxyServer {
+func newProxyServer(cfg config, logger *slog.Logger) (*proxyServer, error) {
 	if cfg.RetryGroupBase <= 0 {
 		cfg.RetryGroupBase = defaultRetryGroup
+	}
+
+	metrics, err := newMetricsStore(cfg.MetricsDBPath, defaultMaxErrorBody, logger)
+	if err != nil {
+		return nil, err
 	}
 
 	transport := http.DefaultTransport.(*http.Transport).Clone()
@@ -168,8 +180,8 @@ func newProxyServer(cfg config, logger *slog.Logger) *proxyServer {
 			Timeout:   cfg.RequestTimeout,
 		},
 		logger:  logger,
-		metrics: newMetricsStore(defaultMaxMetricRecords, defaultMaxErrorBody),
-	}
+		metrics: metrics,
+	}, nil
 }
 
 func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {

@@ -12,9 +12,15 @@ services:
       RETRY_GROUP_BASE: "${RETRY_GROUP_BASE:-5}"
       RETRY_BACKOFF: "${RETRY_BACKOFF:-500ms}"
       REQUEST_TIMEOUT: "${REQUEST_TIMEOUT:-0}"
+      METRICS_DB_PATH: "${METRICS_DB_PATH:-/data/xunfei-retry-proxy.db}"
+    volumes:
+      - xunfei-retry-data:/data
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
       interval: 30s
       timeout: 5s
       retries: 3
       start_period: 5s
+
+volumes:
+  xunfei-retry-data:
