@@ -523,6 +523,38 @@ func TestAdminMetricsStoresRawErrorDetail(t *testing.T) {
 	}
 }
 
+func TestAdminRoutesNeverProxyToUpstream(t *testing.T) {
+	var roundTrips atomic.Int32
+
+	proxy := newTestProxyWithRetryGroupBase(t, "http://upstream/anthropic", 1, 5)
+	proxy.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		roundTrips.Add(1)
+		return newTestHTTPResponse(http.StatusOK, `{"unexpected":true}`), nil
+	})}
+
+	paths := []string{
+		"/admin/api/metrics",
+		"/admin/api/metrics/",
+		"/admin/not-found",
+	}
+	for _, path := range paths {
+		req := httptest.NewRequest(http.MethodGet, "http://proxy"+path, nil)
+		rec := httptest.NewRecorder()
+		proxy.ServeHTTP(rec, req)
+
+		if path == "/admin/not-found" && rec.Code != http.StatusNotFound {
+			t.Fatalf("%s status = %d, want 404", path, rec.Code)
+		}
+		if path != "/admin/not-found" && rec.Code != http.StatusOK {
+			t.Fatalf("%s status = %d, want 200; body=%s", path, rec.Code, rec.Body.String())
+		}
+	}
+
+	if got := roundTrips.Load(); got != 0 {
+		t.Fatalf("admin routes proxied upstream %d times, want 0", got)
+	}
+}
+
 func newTestProxy(t *testing.T, upstreamRaw string, maxRetries int) *proxyServer {
 	return newTestProxyWithRetryGroupBase(t, upstreamRaw, maxRetries, 1)
 }

@@ -8,13 +8,17 @@ import (
 )
 
 func (p *proxyServer) serveAdminHTTP(w http.ResponseWriter, r *http.Request) bool {
+	if r.URL.Path != "/admin" && !strings.HasPrefix(r.URL.Path, "/admin/") {
+		return false
+	}
+
 	switch {
 	case r.URL.Path == "/admin" || r.URL.Path == "/admin/":
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-store")
 		_, _ = w.Write([]byte(adminPageHTML))
 		return true
-	case r.URL.Path == "/admin/api/metrics":
+	case r.URL.Path == "/admin/api/metrics" || r.URL.Path == "/admin/api/metrics/":
 		writeJSON(w, http.StatusOK, p.metrics.snapshot(time.Now()))
 		return true
 	case strings.HasPrefix(r.URL.Path, "/admin/api/errors/"):
@@ -31,7 +35,8 @@ func (p *proxyServer) serveAdminHTTP(w http.ResponseWriter, r *http.Request) boo
 		writeJSON(w, http.StatusOK, detail)
 		return true
 	default:
-		return false
+		http.NotFound(w, r)
+		return true
 	}
 }
 
